@@ -32,6 +32,10 @@ NOTES
     create a glue method that delegates the call to the handle returned by
     '_allocate()'.
 
+    Unless MAX is set, this class will open as many files as possible before
+    closing any. As such, it will monopolise available files, so you should
+    open any other files beforehand.
+
 AUTHOR
     Joseph Walton <joe@kafsemo.org>
 

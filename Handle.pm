@@ -9,20 +9,22 @@ package FileCache::Handle;
 
 use strict;
 
-our $VERSION = '0.001';
+our $VERSION = '0.002';
 
 use IO::Handle;
 our @ISA = ('IO::Handle');
 
 use Symbol;
 use IO::File;
+use Errno;
 
 # The maximum number of files to keep open
-my $MAX = 1024;
+our $MAX = 1024;
 
 # The current instances with a live file open
 my @real;
 
+# Show details of the files that are really open
 sub showReal()
 {
 	print '[', join(',', map { $_ || '' } @real),"]\n";
@@ -43,7 +45,11 @@ sub new($)
 
 	$self->open() or die;
 
-	$self;
+	if ($self->_allocate()) {
+		return $self;
+	} else {
+		return undef;
+	}
 }
 
 sub TIEHANDLE
@@ -67,29 +73,62 @@ use overload (
 	'""' => \&_stringify
 );
 
+sub _release()
+{
+	my $self = shift;
+
+	my $count = 0;
+
+	while (@real >= $MAX) {
+		my $d = shift(@real);
+		my $f = *$d->{'real'};
+		*$d->{'real'} = undef;
+		*$d->{'initial'} = 0;
+		if ($f) {
+			$f->close() or return undef;
+		}
+		$count++;
+	}
+
+	return $count;
+}
+
 sub _allocate()
 {
 	my $self = shift;
 
 	if (!defined(*$self->{'real'})) {
-		if (@real >= $MAX) {
-			my $d = shift(@real);
-			*$d->{'real'}->close();
-			*$d->{'real'} = undef;
-			*$d->{'initial'} = 0;
-		}
-		push @real, $self;
+		defined(_release()) or return undef;
 
 		my $f;
-		if (*$self->{'initial'}) {
-			$f = new IO::File(*$self->{'path'}, '>');
-		} else {
-			$f = new IO::File(*$self->{'path'}, '>>');
-		}
+		do {
+			if (*$self->{'initial'}) {
+				$f = new IO::File(*$self->{'path'}, '>');
+			} else {
+				$f = new IO::File(*$self->{'path'}, '>>');
+			}
+
+			# If opening failed because of EMFILE, correct $MAX
+			if (!$f) {
+				if ($!{EMFILE}) {
+					if (@real < $MAX) {
+						$MAX = @real;
+					} else {
+						die "$!: ".scalar(@real)." open, MAX is $MAX";
+					}
+				} else {
+					return undef;
+					die "Unable to open file: $!";
+				}
+			}
+		} while (!$f && _release());
+
 		if (*$self->{'binmode'}) {
-			binmode($f, *$self->{'binmode'});
+			binmode($f, *$self->{'binmode'}) or return undef;;
 		}
+
 		*$self->{'real'} = $f;
+		push @real, $self;
 	} else {
 		# XXX Should move $self to the head of @real, for LRU behaviour
 	}
@@ -99,14 +138,20 @@ sub _allocate()
 
 sub print
 {
-	shift->PRINT(@_);
+	return shift->PRINT(@_);
 }
 
 sub PRINT
 {
 	my $self = shift;
 
-	$self->_allocate()->print(@_);
+	my $f = $self->_allocate();
+	
+	if ($f) {
+		return $f->print(@_);
+	} else {
+		return undef;
+	}
 }
 
 sub BINMODE
@@ -116,8 +161,21 @@ sub BINMODE
 
 	*$self->{'binmode'} = $bm;
 
-	if (defined(*$self->{'real'})) {
+	if (*$self->{'real'}) {
 		return binmode(*$self->{'real'}, $bm);
+	} else {
+		return 1;
+	}
+}
+
+sub CLOSE
+{
+	my $self = shift;
+	if (*$self->{'real'}) {
+		my $f = *$self->{'real'};
+		*$self->{'real'} = undef;
+		# XXX Should remove $self from @real
+		return $f->close();
 	} else {
 		return 1;
 	}
@@ -169,6 +227,10 @@ FileCache::Handle uses instances of IO::Handle, and so works well with
 The only operations supported are 'print' and 'binmode'. To add more,
 create a glue method that delegates the call to the handle returned by
 '_allocate()'.
+
+Unless MAX is set, this class will open as many files as possible before
+closing any. As such, it will monopolise available files, so you
+should open any other files beforehand.
 
 =head1 AUTHOR
 
